@@ -1,0 +1,687 @@
+---
+title: "Markov chain Monte Carlo"
+author: "Taavi Päll and Ülo Maiväli"
+date: "2021-10-16"
+output: html_document
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Libraries
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(here)
+library(brms)
+library(bayesplot)
+library(tidybayes)
+library(modelr)
+library(lubridate)
+library(rstan)
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+```
+
+## MCMC process
+
+Common illustrations of how **Markov chain Monte Carlo** process works involves 
+islands nation and politicians (see [Kruschke](https://sites.google.com/site/doingbayesiandataanalysis/) and [McElreath](https://xcelab.net/rm/statistical-rethinking/)).
+
+
+```{r echo=FALSE, out.width='70%'}
+knitr::include_graphics(here("figs/islands.png"))
+```
+
+
+This is how the story goes -- let's imagine that we have a nation that lives on 10 islands, each 
+island has population proportional to its size.
+
+During evergoing campaigning, politician/president/king needs to visit all 
+islands, but logic of politics requires them to make proportionally more visits 
+to bigger islands.
+
+```{r echo=FALSE, out.width='70%'}
+knitr::include_graphics(here("figs/pipi.jpeg"))
+```
+
+
+To achieve this, their adviser has suggested following clever strategy.    
+
+1. Let's say that each week they need to decide whether to move to 
+randomly selected next island or stay.
+
+2. If next island has bigger population, then they move to that island. 
+If selected island has smaller population, adviser fills bag with black (move) and 
+white peas (stay) proportional to smaller island population to current island. 
+Then one pea is randomly picked from the bag and if it's black then they move.
+
+This is how we can describe the process in R:
+```{r}
+set.seed(9)
+
+weeks <- 1e4
+islands <- rep(0, weeks) 
+current   <- 10
+
+for (i in 1:weeks) {
+  
+  # record current position 
+  islands[i] <- current
+  
+  # choose next island
+  proposal <- sample(1:10, size = 1)
+  
+  # move?
+  prob_move <- proposal / current
+  current <- ifelse(runif(1) < prob_move, proposal, current)
+  
+}  
+```
+
+
+Islands visited during first 100 weeks, seems random:
+```{r}
+tibble(week = 1:weeks,
+       islands) %>%
+  head(100) %>% 
+  ggplot(aes(x = week, y = islands)) +
+  geom_point()
+```
+
+Patterns emerge in the long term. Island visits through history is proportional to island population:
+```{r}
+tibble(islands) %>%
+  ggplot(aes(x = islands)) +
+  geom_histogram(binwidth = 1) +
+  scale_x_continuous(breaks = 1:10) +
+  labs(y = "number of visits")
+```
+
+> This simulation illustrates key property of MCMC process: the algorithm needs 
+to know only the value of current island and value of new island to 
+make a move, resulting in long-run island visits proportional to their size.
+
+
+In real applications, the goal is not to help an politician schedule his campaign, 
+but to draw samples from an unknown target distribution, like a posterior 
+probability distribution.
+
++ The 'islands' in our objective are parameter values.
++ The 'population sizes' in our objective are the posterior probabilities at 
+each parameter value.
++ The 'weeks' in our objective are samples taken from the joint posterior of 
+the parameters in the model.
+
+Metropolis algorithm works when proposing a jump from A to B is equal to 
+proposing jump from B to A (a **symmetric proposal**).
+
+### Metropolis-Hastings algorithm
+
+MH algorithm is more clever version of Metropolis algorithm, allowing 
+**asymmetric proposals** which work more efficiently in situations where 
+parameter values have boundaries near zero, like standard deviation.
+
+Here is an example of an MH algorithm to sample from following posterior:
+
+$$y \sim \text{t3}(\mu, 1)$$
+$$\mu \sim \text{t3}(0, 1)$$
+
+Function to calculate posterior density
+```{r}
+p <- function(mu) {
+  dt(mu, 3) * prod(dt(y, 3, mu))
+}
+```
+
+Here's our data
+```{r}
+y <- c(-1, 1, 5)
+```
+
+
+Let's do sampling (N-1 samples will be collected to mu)
+```{r}
+N <- 10000
+mu <- numeric(N)
+for (i in 1:(N-1)) {
+  proposal <- mu[i] + rnorm(1) 
+  r <- p(proposal) / p(mu[i])
+  accept <- rbinom(1, 1, min(1, r))
+  mu[i+1] <- if (accept) proposal else mu[i]
+}
+```
+
+Visualize posterior samples (hairy caterpillar)
+```{r}
+plot(mu, type = "l", main = "y <- c(-1, 1, 5)")
+```
+
+Let's have look at correlation between steps:
+```{r}
+# lag = 1
+cor(mu[-1], lag(mu, 1)[-1]) # consecutive steps
+# lag = 5
+cor(mu[-1:-5], lag(mu, 5)[-1:-5]) 
+```
+
+With another set of values, we can see that it takes some number of initial steps 
+for Markov chain to converge to posterior distribution (warm-up / burn-in). 
+```{r}
+y <- c(39, 41, 45)
+N <- 10000
+mu <- numeric(N)
+for (i in 1:(N-1)) {
+  proposal <- mu[i] + rnorm(1) 
+  r <- p(proposal) / p(mu[i])
+  accept <- rbinom(1, 1, min(1, r))
+  mu[i+1] <- if (accept) proposal else mu[i]
+}
+plot(mu, type = "l", main = "y <- c(39, 41, 45)")
+```
+
+In this case, it's also visible substantial autocorrelation.
+Markov chain that converges to a stationary posterior distribution we expect 
+the autocorrelation to decrease as the lag between $X_n$ and $X_{n+d}$ is 
+increased.
+```{r}
+# lag = 1
+cor(mu[-1], lag(mu, 1)[-1])
+# lag = 200
+cor(mu[-1:-200], lag(mu, 200)[-1:-200])
+```
+
+
+Autocorrelation and convergence can be tuned with proposal step size. 
+In previous examples, proposal was with $\sigma = 1$. 
+
+Let's increase sigma to 15
+```{r, warning=FALSE}
+y <- c(39, 41, 45)
+N <- 10000
+mu <- numeric(N)
+for (i in 1:(N-1)) {
+  proposal <- mu[i] + rnorm(1, 0, 15) 
+  r <- p(proposal) / p(mu[i])
+  accept <- rbinom(1, 1, min(1, r))
+  mu[i+1] <- if (accept) proposal else mu[i]
+}
+plot(mu, type = "l", main = "y <- c(39, 41, 45); sigma = 15")
+```
+
+Proposal acceptance rate
+```{r}
+1 - mean(duplicated(mu))
+```
+
+
+Hairy caterpillar again.
+
+sigma = 200
+```{r, warning=FALSE}
+y <- c(39, 41, 45)
+N <- 10000
+mu <- numeric(N)
+for (i in 1:(N-1)) {
+  proposal <- mu[i] + rnorm(1, 0, 200) 
+  r <- p(proposal) / p(mu[i])
+  accept <- rbinom(1, 1, min(1, r))
+  mu[i+1] <- if (accept) proposal else mu[i]
+}
+plot(mu, type = "l", main = "y <- c(39, 41, 45); sigma = 15")
+```
+
+Acceptance rate
+```{r}
+1 - mean(duplicated(mu))
+```
+
+Optimal acceptance rate is ~44% and has limit at ~23.4% (<https://www.maths.lancs.ac.uk/~sherlocc/Publications/rwm.final.pdf>). 
+
+#### Summary to MH
+
+Metropolis algorithm is grandparent to Gibbs sampler, which is more efficient 
+implementation of Metropolis approach, and is used until today in packages 
+BUGS and JAGS, but Gibbs sampler has limitations:    
+
+- first, requirement for conjugate prior --
+if the posterior distribution is in the same family of the prior distribution, 
+then the prior and posterior are called conjugate distributions, 
+and the prior is called the conjugate prior.
+This means also that choosing conjugate prior helps us to compute the posterior distribution just by updating the parameters of prior distribution.
+
+- Second, as models become more complex and contain lots of parameters, both 
+Metropolis and Gibbs sampling become inefficient, as they get stuck in small 
+regions of the posterior for potentially a long time.
+
+> Simulation of MH and HMC <http://elevanth.org/blog/2017/11/28/build-a-better-markov-chain/> @ R. McElreath blog
+
+
+### Hamiltonian Monte Carlo -- playing hokey in a gravitational wave
+
+HMC is described as follows, imagine a frictionless hockey pluck sliding over a 
+surface, being stopped at some point in time and then kicked again in a random 
+direction.
+
+- HMC runs a physics experiment and makes mostly good proposal. (<https://arogozhnikov.github.io/2016/12/19/markov_chain_monte_carlo.html>)
+- HMC compares energy at the start and at the end of each step, if energy difference is large (puck shoots over the edge), then algorithm rejects the proposal.
+
+The major differences compared to Metropolis-Hastings are:
+- Distances between successive generated points are typically large, so less 
+iterations is needed to get representative sampling
+
+- HMC in most cases accepts new states. HMC uses a rejection criterion
+because it is only approximating the smooth path of a particle and when numerical approximation is bad, then rejects the proposal.
+Whereas paths are not continuous but consist of multiple **leapfrog steps**, 
+where step size determines granularity of the path and is picked
+automatically by the machine. 
+
+
+#### HMC simulation
+
+To simulate HMC samples, two functions are necessary: 
+
+**log-density function** -- upper part of Bayes formula and
+**gradient function** -- the slope in all directions at the current position
+
+`rethinking::HMC2` function runs a single trajectory, and produces a single sample. 
+The function needs to be used repeatedly to build a chain.
+
+U is function to return log-density
+grad_U is function to return gradient of U
+epsilon is leapfrog step size
+L is number of leapfrog steps
+current_q is initial position
+
+```{r}
+HMC2 <- function (U, grad_U, epsilon, L, current_q) {
+  
+  # The first chunk of the function chooses random momentum of the particle and initializes the trajectory
+  q = current_q
+  p = rnorm(length(q), 0, 1) # random flick - p is momentum.
+  current_p = p
+  
+  # Make a half step for momentum at the beginning
+  p = p - epsilon * grad_U(q) / 2
+  
+  # Initialize bookkeeping - saves trajectory
+  qtraj <- matrix(NA, nrow = L + 1, ncol = length(q))
+  ptraj <- qtraj
+  qtraj[1,] <- current_q
+  ptraj[1,] <- p
+  
+  # Looping over leapfrog steps. L steps are taken, using the gradient to compute a linear approximation of the log-posterior surface at each point
+  # step size epsilon is added to the position and momentum vectors
+  for (i in 1:L) {
+    q = q + epsilon * p # Full step for the position
+    
+    # Make a full step for the momentum, except at end of trajectory
+    if (i != L) {
+      p = p - epsilon * grad_U(q)
+      ptraj[i+1, ] <- p
+    }
+    qtraj[i+1, ] <- q
+  }
+  
+  # Make a half step for momentum at the end
+  p = p - epsilon * grad_U(q) / 2
+  ptraj[L + 1, ] <- p
+  
+  # Negate momentum at end of trajectory to make the proposal symmetric
+  p = -p
+  
+  # Evaluate potential and kinetic energies at start and end of trajectory
+  current_U = U(current_q)
+  current_K = sum(current_p ^ 2) / 2
+  proposed_U = U(q)
+  proposed_K = sum(p ^ 2) / 2
+  
+  # Accept or reject the state at end of trajectory, returning either
+  # the position at the end of the trajectory or the initial position
+  accept <- 0
+  # In Hamiltonian dynamics, the total energy of the system must be constant. 
+  # So if the energy at the start of the trajectory differs substantially 
+  # from the energy at the end, something has gone wrong >> Divergent transition
+  if (runif(1) < exp(current_U - proposed_U + current_K - proposed_K)) {
+    new_q <- q  # accept
+    accept <- 1
+  } else {
+    new_q <- current_q  # reject
+    }
+  
+  return(list(q = new_q, traj = qtraj, ptraj = ptraj, accept = accept))
+}
+```
+
+The function U to return the log-posterior, note that x and y are not function parameters:
+```{r}
+# U needs to return neg-log-probability
+U <- function(q, a = 0, b = 1, k = 0, d = 1) {
+    muy <- q[1]
+    mux <- q[2]
+    U <- sum(dnorm(y, muy, 1, log = TRUE)) + 
+      sum(dnorm(x, mux, 1, log = TRUE)) +
+        dnorm(muy , a, b, log = TRUE) + 
+      dnorm(mux, k, d, log = TRUE)
+    return(-U)
+}
+```
+
+Gradient function, in this case it means two derivatives, note that x and y are not function parameter:
+```{r}
+# Need vector of partial derivatives of U with respect to vector q
+U_gradient <- function(q, a = 0, b = 1, k = 0, d = 1) {
+    muy <- q[1]
+    mux <- q[2]
+    G1 <- sum(y - muy) + (a - muy) / b ^ 2 # dU / dmuy
+    G2 <- sum(x - mux) + (k - mux) / d ^ 2 # dU / dmux
+    return(c(-G1 , -G2)) # negative bc energy is neg-log-prob
+}
+```
+
+Let's run two-dimensional simulation with two vectors x and y, both $Normal(0, 1)$.
+```{r}
+# test data
+set.seed(7)
+# Sampling and scaling input vectors x and y
+y <- rnorm(50)
+x <- rnorm(50)
+x <- as.numeric(scale(x))
+y <- as.numeric(scale(y))
+library(shape) # for fancy arrows
+Q <- list()
+Q$q <- c(-0.1, 0.2) # initial values
+pr <- 0.3
+plot(NULL, ylab = "muy", xlab = "mux", xlim = c(-pr, pr), ylim = c(-pr, pr))
+step <- 0.03
+L <- 11 # 0.03/28 for U-turns --- 11 for working example
+n_samples <- 4
+path_col <- rethinking::col.alpha("black", 0.5)
+points(Q$q[1], Q$q[2], pch = 4, col = "black" )
+for (i in 1:n_samples) {
+    Q <- HMC2(U, U_gradient, step, L, Q$q)
+    if (n_samples < 10) {
+      for (j in 1:L) {
+        K0 <- sum(Q$ptraj[j, ] ^ 2) / 2 # kinetic energy
+        lines(Q$traj[j:(j + 1), 1] , Q$traj[j:(j + 1), 2], col = path_col, lwd = 1 + 2 * K0)
+      }
+      points(Q$traj[1:L + 1, ] , pch = 16, col = "white", cex = 0.35)
+      Arrows(Q$traj[L, 1], Q$traj[L, 2], Q$traj[L + 1, 1], Q$traj[L + 1, 2], arr.length = 0.35, arr.adj = 0.7)
+      text(Q$traj[L+1, 1], Q$traj[L+1, 2], i, cex = 0.8, pos = 4, offset = 0.4)
+    }
+    points(Q$traj[L + 1, 1], Q$traj[L + 1, 2], pch = ifelse(Q$accept == 1, 16, 1))
+}
+```
+
+This is a working example with L = 11 leapfrog steps, note apparently low autocorrelation.
+Cross marks starting point, white dots represent leapfrog steps, width of the line denotes momentum.
+
+Low autocorrelation is not automatic. See what happens with L = 28.
+Because of the combination of leapfrog steps and step size, the paths tend to 
+land close to where they started and instead of independent samples from the 
+posterior, we get correlated samples, like in a Metropolis chain.
+
+To avoid steps landing where they started HMC uses **No U-Turn Sampler** (NUTS) 
+approach (see HMC simulations in McElreath blog).
+
+## Problems in HMC sampling
+
+We already introduced some diagnostic plots to assess how model fitting has succeeded, like `plot.brmsfit` (or similar methods from other packages using rstan) method. 
+
+```{r}
+# let's load some fitted model object
+m <- read_rds(here("models/log_gdp~rugged+continent+rugged:continent.rds"))
+```
+
+Have a look at the Trace and Density Plots for MCMC Samples.
+
+```{r}
+plot(m)
+```
+
+Pairs plot helps to understand how Gaussian samples are and how correlated are our model parameters:    
+
+```{r}
+pairs(m)
+```
+
+But there are more functions to visually assess MCMC samples in **bayesplot** package.
+
+
+### General MCMC diagnostics
+
+#### R_hat
+
+R_hat estimates mcmc chain convergence by comparing parallel chains with each other, r_hat is 1 when chains have converged. When chains are not convereged to a common distribution, then r_hat is bigger than 1 (r_hat>1.05).
+
+The bayesplot package provides the functions `mcmc_rhat()` and `mcmc_rhat_hist()` for visualizing r_hat estimates.
+
+Let's fit a new model with too few mcmc samples:
+```{r}
+mb <- update(m, iter = 50)
+mb
+```
+
+
+Our rhats from last model are high, suggesting that model has not converged.
+We can pull out rhats from model objects with `rhat` function:
+
+```{r}
+rhats <- rhat(mb)
+print(rhats)
+```
+
+These rhats can be visualized using `mcmc_rhat` convenience function: 
+
+```{r}
+mcmc_rhat(rhats) + yaxis_text(hjust = 1)
+```
+
+Same (original) model with 2000 samples:
+```{r}
+mcmc_rhat(rhat = rhat(m)) + yaxis_text(hjust = 0)
+```
+
+Histogram of rhats:
+```{r}
+mcmc_rhat_hist(rhat = rhat(mb), binwidth = 0.0001)
+```
+
+#### Effective sample size
+
+The effective sample size is an estimate of the number of independent draws from
+the posterior distribution. 
+
+Because the draws within a Markov chain are not independent if there is 
+autocorrelation, *Neff* is usually smaller than the total sample size, N.
+(Although it may be larger in some cases because how its [calculated](https://mc-stan.org/docs/2_18/reference-manual/effective-sample-size-section.html) >> 
+The NUTS algorithm used in Stan can produce Neff > N for 
+parameters which have close to Gaussian posterior and little dependency 
+on other parameters.).
+
+As a rule of thumb, bigger `Neff / N` ratio is better.
+
+```{r}
+ratios <- neff_ratio(m)
+print(ratios)
+```
+
+
+```{r}
+mcmc_neff(ratios, size = 2)
+```
+
+Let's compare two models with different parametrization: centered vs non-centered
+
+```{r}
+waffledivorce <- read_csv2(here("data/waffledivorce.csv"))
+data <- waffledivorce %>% 
+  mutate(
+    MedianAgeMarriage = MedianAgeMarriage / 10, 
+    MedianAgeMarriage_ctd = MedianAgeMarriage - mean(MedianAgeMarriage)
+    ) %>% 
+  select(Divorce, MedianAgeMarriage, MedianAgeMarriage_ctd) %>% 
+  drop_na()
+```
+
+```{r}
+mm <- brm(
+  formula = Divorce ~ MedianAgeMarriage,
+  data = data,
+  family = gaussian(),
+  prior = prior("normal(0, 0.3)", class = "b"),
+  chains = 2,
+  file = here("models/Divorce~MedianAgeMarriage_non_ctd")
+)
+mm_ctd <- brm(
+  formula = Divorce ~ MedianAgeMarriage_ctd,
+  data = data,
+  family = gaussian(),
+  prior = prior("normal(0, 0.3)", class = "b"),
+  chains = 2,
+  file = here("models/Divorce~MedianAgeMarriage_ctd")
+)
+```
+
+Not much difference in this case, sigma has bigger Neff / N ratio in age-centered model (but see https://cran.r-project.org/web/packages/bayesplot/vignettes/visual-mcmc-diagnostics.html).
+```{r}
+neff_mm <- neff_ratio(mm, pars = c("b_Intercept", "b_MedianAgeMarriage", "sigma"))
+neff_ctd <- neff_ratio(mm_ctd, pars = c("b_Intercept", "b_MedianAgeMarriage_ctd", "sigma"))
+library(patchwork)
+(mcmc_neff(neff_mm) + yaxis_text(hjust = 1)) / (mcmc_neff(neff_ctd) + yaxis_text(hjust = 1))
+```
+
+
+#### Autocorrelation
+
+As mentioned above, Neff/N decreases as autocorrelation becomes more extreme. 
+Autocorrelation can be visualised using the `mcmc_acf` (line plot) or 
+`mcmc_acf_bar` (bar plot) functions.
+
+```{r}
+mcmc_acf(as.array(mm), pars = "sigma", lags = 10)
+mcmc_acf(as.array(mm_ctd), pars = "sigma", lags = 10)
+```
+
+
+
+### Diagnostics for the No-U-Turn Sampler
+
+#### Divergent transitions
+
+Divergent transition warnings indicate that something is wrong with the model and the results should not be trusted.
+
+Let's fit two models, one with informative prior (m) and other one with non-informative prior (m10) for population level effects b.   
+
+```{r}
+hf <- read_csv2(here("data/HF_data.csv")) %>% 
+  mutate_at("postacute_therapy", as.numeric)
+get_prior(postacute_therapy ~ county + (1 | county), data = hf, family = gaussian())
+m <- brm(
+  postacute_therapy ~ county + (1 | county), 
+  data = hf, 
+  family = gaussian(),
+  prior = prior("normal(0, 0.5)", class = "b"),
+  chains = 2,
+  file = here("models/postacute_therapy ~ county + (1 | county)")
+  )
+m10 <- brm(
+  postacute_therapy ~ county + (1 | county), 
+  data = hf, 
+  family = gaussian(),
+  prior = prior("normal(0, 25)", class = "b"),
+  chains = 2,
+  file = here("models/postacute_therapy ~ age + county + (1 | county)_N(0,25)")
+  )
+```
+
+If we print out second model, where we used non-informative priors, we see a warning saying that bunch of divergent transitions have taken place.
+
+```{r}
+summary(m10)
+```
+
+This is our "good" model:
+
+```{r}
+mcmc_parcoord(as.array(m), np = nuts_params(m), pars = c("b_Intercept", "b_age", "sigma"), regex_pars = "county") + xaxis_text(angle = 90, hjust = 1, vjust = 0.5)
+```
+
+
+If we print out our pathological model, we can see bunch of red lines indicating
+divergent transitions. But whats wrong?
+
+```{r}
+mcmc_parcoord(as.array(m10), np = nuts_params(m10), pars = c("b_Intercept", "b_age", "sigma"), regex_pars = "county") + xaxis_text(angle = 90, hjust = 1, vjust = 0.5)
+```
+
+
+In this case, apparently allowing population-level effects/coefficients to take extreme values constrains group-level effects.
+
+```{r}
+mcmc_pairs(as.array(m10), np = nuts_params(m10), pars = c("b_countyrapla", "r_county[rapla,Intercept]"),
+           off_diag_args = list(size = 0.75))
+```
+
+
+```{r}
+mcmc_pairs(as.array(m), np = nuts_params(m), pars = c("b_countyrapla", "r_county[rapla,Intercept]"),
+           off_diag_args = list(size = 0.75))
+```
+
+Traceplot to illustrate that chain gets "stuck" at extreme parameter values 
+(only iterations from 0 to 300 are shown, set by window argument):
+
+```{r}
+mcmc_trace(as.array(m10), np = nuts_params(m10), pars = c("b_countyrapla", "r_county[rapla,Intercept]"), window = c(0, 300)) + 
+  xlab("Post-warmup iteration")
+```
+
+#### mcmc_nuts_divergence
+
+In the top panel we see the distribution of the log-posterior when there was no divergence vs the distribution when there was a divergence. 
+
+Divergences often indicate that some part of the posterior isn’t being explored 
+
+and the plot confirms that lp|Divergence indeed has lighter tails than lp|No divergence.
+
+The bottom panel shows the same thing but instead of the log-posterior the NUTS acceptance statistic is shown.
+
+```{r}
+mcmc_nuts_divergence(nuts_params(m10), log_posterior(m10))
+```
+
+
+##### Increasing adapt_delta above 0.8 may help
+
+If there are only a few divergences, then it's possible to get rid of them by increasing 
+the **adapt_delta** parameter (the target acceptance rate, with upper limit 1), 
+which lowers the step size used by the sampler and allowing the Markov chains to 
+explore more complicated curvature in the target distribution.
+
+
+#### Maximum treedepth exceeded
+
+Divergent transitions warnings are a validity concern, hitting the maximum treedepth is an efficiency concern.
+
+Configuring the NUTS involves putting a cap on the depth of the trees (what trees: Tree depth is an important diagnostic tool for NUTS. For example, a tree depth of zero occurs when the first leapfrog step is immediately rejected and the initial state returned, indicating extreme curvature and poorly-chosen step size (at least relative to the current position). On the other hand, a tree depth equal to the maximum depth indicates that NUTS is taking many leapfrog steps and being terminated prematurely to avoid excessively long execution time) that it evaluates during each iteration. 
+This is controlled through a maximum depth parameter max_treedepth. When the maximum allowed tree depth is reached it indicates that NUTS is terminating prematurely to avoid excessively long execution time.
+
+## References
+
+- Brief Guide to Stan’s Warnings <https://mc-stan.org/misc/warnings.html>
+
+- Visual MCMC diagnostics using the bayesplot package <https://cran.r-project.org/web/packages/bayesplot/vignettes/visual-mcmc-diagnostics.html#energy-and-bayesian-fraction-of-missing-information>
+
+- Diagnosing Biased Inference with Divergences <https://betanalpha.github.io/assets/case_studies/divergences_and_bias.html>
+
+- HMC Algorithm Parameters <https://mc-stan.org/docs/2_18/reference-manual/hmc-algorithm-parameters.html>
+
+
+
+
